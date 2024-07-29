@@ -145,7 +145,21 @@ class SkipBatchSampler(BatchSampler):
 
     def __len__(self):
         return len(self.batch_sampler) - self.skip_batches
+        
+def collate_fn(batch):
+    input_ids = [torch.tensor(item['input_ids']) for item in batch]
+    attention_mask = [torch.tensor(item['attention_mask']) for item in batch]
+    labels = [item['label'] for item in batch]
 
+    input_ids = torch.stack(input_ids)
+    attention_mask = torch.stack(attention_mask)
+    labels = torch.tensor(labels)
+
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'labels': labels
+    }
 
 class SkipDataLoader(DataLoader):
     """

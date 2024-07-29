@@ -21,6 +21,7 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     StateDictType,
 )
+from torch.utils.data import DataLoader # dido dataloader
 
 import transformers
 from transformers import (
@@ -29,7 +30,11 @@ from transformers import (
     AutoTokenizer,
     LlamaConfig,
     default_data_collator,
+DataCollatorWithPadding,
+AutoModelForSequenceClassification,
+DataCollatorForTokenClassification,
 )
+import pandas as pd
 from tokenizers import Tokenizer
 
 import datasets
@@ -44,6 +49,7 @@ from peft_pretraining.dataloader import SkipDataLoader
 from peft_pretraining.modeling_llama import LlamaForCausalLM
 from peft_pretraining.modeling_pythia import GPTNeoXForCausalLM
 from peft_pretraining.relora import ReLoRaModel, ReLoRaLinear, merge_and_reinit_functional
+from peft_pretraining.dataloader import collate_fn
 
 from peft_pretraining.megatron_dataset.arguments import NeoXArgs
 from peft_pretraining.megatron_dataset import data_utils as megatron_data_utils
@@ -163,7 +169,7 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
 
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        loss = model(**batch, labels=batch["input_ids"]).loss
+        loss = model(input_ids=batch['input_ids'], labels=batch['labels']).loss
         if torch.isnan(ddp_loss_info[0]):
             print(f"Rank {dist.get_rank()} got nan loss. This is probably a bug.")
 
@@ -492,7 +498,7 @@ def main(args):
         model = LlamaForCausalLM(model_config)
     else:
         logger.info(f"Using HuggingFace model {args.model_name_or_path} revision {args.model_revision}")
-        model = GPTNeoXForCausalLM.from_pretrained(args.model_name_or_path, revision=args.model_revision)
+        model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, revision=args.model_revision)
         model_config = model.config
 
     global_step = 0
@@ -544,13 +550,25 @@ def main(args):
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=0.1,
-            target_modules=["attn", "attention", "mlp"],
+            target_modules=["q","o","k","v"],
             trainable_scaling=args.train_scaling,
-            keep_original_weights=True,
+            keep_original_weights=False,
             lora_only=not need_linear_weight,
             quantize=args.quantize,
             use_double_quant=args.use_double_quant,
         )
+    def print_trainable_parameters(model):
+        trainable_params = 0
+        all_param = 0
+        for _, param in model.named_parameters():
+            all_param += param.numel()
+            if param.requires_grad:
+               trainable_params += param.numel()
+        print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
+    )
+    print_trainable_parameters(model)
+     
 
     if args.resume_from:
         logger.info(f"Loading model from {args.resume_from}")
@@ -716,28 +734,34 @@ def main(args):
                 raise RuntimeError("Cannot resume from a checkpoint with a different batch size.")
 
     if args.dataset_path is not None:
+        print(f"dido test {train_dataset}")
+       
         # Huggingface dataset to dataloader
         logger.info(f"Full training set size: {len(train_dataset)}")
         logger.info(repr(train_dataset))
         train_dataset = datasets.distributed.split_dataset_by_node(train_dataset, rank=global_rank, world_size=world_size)
         eval_dataset = datasets.distributed.split_dataset_by_node(eval_dataset, rank=global_rank, world_size=world_size)
         logger.info(f"Train set size after shard: {len(train_dataset)}")
-
+        print(f"dido2 test {train_dataset}")
+        
+        data_collator = DataCollatorForTokenClassification(tokenizer)
+        
         _skip_batches = update_step * args.gradient_accumulation
         logger.info(f"Skipping the first {_skip_batches} batches")
         train_loader = SkipDataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            collate_fn=default_data_collator,
+            collate_fn=data_collator,
             skip_batches=_skip_batches,
             num_workers=args.workers,
         )
         eval_loader = torch.utils.data.DataLoader(
             eval_dataset,
             batch_size=args.batch_size,
-            collate_fn=default_data_collator,
+            collate_fn=data_collator,
             num_workers=args.workers,
         )
+        
         test_loader = None
     else:
         # Megatron dataset to dataloader
@@ -764,8 +788,24 @@ def main(args):
         # fix tqdm visual length to 80 so that the progress bar
         # doesn't jump around when changing from external display to laptop
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
+        print(f"dido3 test {train_dataset}")
+        
+    df = train_dataset.to_pandas()
+     # Convert DataFrame to a list of dictionaries
+    list_of_dicts = df.to_dict(orient='records')
+    #print(f"list of dict: {list_of_dicts}")
 
-    for batch in train_loader:
+    df_eval = eval_dataset.to_pandas()
+    list_of_dicts_2 = df_eval.to_dict(orient='records')
+
+    
+       
+
+    my_train_dataloader = DataLoader(list_of_dicts, batch_size=args.batch_size, shuffle=True,collate_fn = collate_fn) #dido data loader
+    my_test_dataloader = DataLoader(list_of_dicts_2, batch_size=args.batch_size, shuffle=True,collate_fn = collate_fn) #dido data loader
+        
+    for batch in my_train_dataloader:
+        
         global_step += 1
         local_step += 1
 
@@ -779,11 +819,15 @@ def main(args):
             logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
             print(f"Rank {global_rank} stopping training.")
             break
+            
+        #print(batch.items())
 
         batch = {k: v.to(device) for k, v in batch.items()}
         tokens_seen += batch["input_ids"].numel() * world_size
+        
+    
 
-        loss = model(**batch, labels=batch["input_ids"]).loss
+        loss =  model(input_ids=batch['input_ids'], labels=batch['labels']).loss
 
         loss_info[0] += loss.detach()
         loss_info[1] += 1
@@ -855,7 +899,7 @@ def main(args):
         # EVALUATION
         if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
-            total_loss, evaluated_on_tokens = evaluate_model(model, eval_loader, device)
+            total_loss, evaluated_on_tokens = evaluate_model(model, my_test_dataloader, device)
 
             if global_rank == 0:
                 wandb.log({
@@ -877,6 +921,7 @@ def main(args):
         )
 
         if can_reset_relora and (update_step - scheduler_start_step) % args.relora == 1:
+
             _lora_reset_time = time.time()
             logger.info(f"{args.resume_from=}, {local_step=}, {args.relora=}, thresh: {local_step // args.gradient_accumulation}")
             logger.info(f"Performing lora reset at update step {update_step}. Current lr is {optimizer.param_groups[0]['lr']}")
@@ -982,7 +1027,7 @@ def main(args):
     torch.cuda.empty_cache()
 
     total_loss, evaluated_on_tokens = evaluate_model(
-        model, eval_loader, device,
+        model, my_test_dataloader, device,
         target_eval_tokens=100_000_000,
     )
 
