@@ -151,8 +151,9 @@ def collate_fn(batch):
     attention_mask = [torch.tensor(item['attention_mask']) for item in batch]
     labels = [item['label'] for item in batch]
 
-    input_ids = torch.stack(input_ids)
-    attention_mask = torch.stack(attention_mask)
+    # Pad the sequences dynamically
+    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
     labels = torch.tensor(labels)
 
     return {
