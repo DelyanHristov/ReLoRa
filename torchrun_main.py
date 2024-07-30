@@ -9,7 +9,7 @@ import json
 import random
 import argparse
 from typing import Union
-
+from sklearn.metrics import f1_score
 import numpy as np
 
 import torch
@@ -39,6 +39,7 @@ from tokenizers import Tokenizer
 
 import datasets
 import datasets.distributed
+from datasets import load_metric
 import wandb
 
 from tqdm import tqdm
@@ -145,8 +146,7 @@ def parse_args(args=None):
 
     return args
 
-
-
+metric = load_metric("glue", "cola")
 @torch.no_grad()
 def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens=10_000_000):
     _time = time.time()
@@ -157,6 +157,9 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
     tokens_in_batch_info = torch.zeros(1).to(device)
 
     rank = dist.get_rank()
+    all_predictions = []
+    all_labels = []
+
     for i, batch in enumerate(eval_dataloader):
         if i == 0:
             # this way of estiming the number of eval steps
@@ -170,7 +173,9 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
 
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        loss = model(input_ids=batch['input_ids'], labels=batch['labels']).loss
+        outputs = model(input_ids=batch['input_ids'], labels=batch['labels'])
+        loss = outputs.loss
+        logits = outputs.logits
         if torch.isnan(ddp_loss_info[0]):
             print(f"Rank {dist.get_rank()} got nan loss. This is probably a bug.")
 
@@ -179,6 +184,11 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
         ddp_loss_info[0] += loss.detach()
         ddp_loss_info[1] += 1
         ddp_loss_info[2] += tokens_in_batch
+
+        predictions = torch.argmax(logits, dim=-1).cpu().numpy()
+        labels = batch["labels"].cpu().numpy()
+        all_predictions.extend(predictions)
+        all_labels.extend(labels)
 
     # check if loss is nan
     if torch.isnan(ddp_loss_info[0]):
@@ -190,10 +200,18 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
     evaluated_on_tokens = ddp_loss_info[2].item()
     logger.info(f"Evaluated on {evaluated_on_tokens} tokens, eval loss: {eval_loss:.4f}")
 
+    f1 = f1_score(all_labels, all_predictions, average='weighted')
+    logger.info(f"Evaluation F1 Score: {f1:.4f}")
+
+    metric_results = metric.compute(predictions=all_predictions, references=all_labels)
+    metric_results = metric_results["matthews_correlation"]
+
+    logger.info(f"Evaluation metric Score: {metric_results:.4f}")
+
     logger.info(f"Evaluation took {time.time() - _time:.2f} seconds")
 
     if was_training: model.train()
-    return eval_loss, evaluated_on_tokens
+    return eval_loss, evaluated_on_tokens, f1, metric_results
 
 
 def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
@@ -904,16 +922,18 @@ def main(args):
         # EVALUATION
         if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
-            total_loss, evaluated_on_tokens = evaluate_model(model, my_test_dataloader, device)
+            total_loss, evaluated_on_tokens, f1_score_val, metric_score = evaluate_model(model, my_test_dataloader, device)
 
             if global_rank == 0:
                 wandb.log({
                     "final_eval_loss": total_loss,
                     "final_eval_tokens": evaluated_on_tokens,
+                    "f1_score": f1_score_val,
+                    "metric_score": metric_score
                     },
                     step=global_step,
                 )
-            logger.info(f"Eval loss at step {update_step}: {total_loss}")
+            logger.info(f"Eval loss at step {update_step}: {total_loss}, F1 Score: {f1_score_val}, Metric Score: {metric_score}")
         # ##############################
 
         # ##############################
@@ -1031,7 +1051,7 @@ def main(args):
     import gc; gc.collect()
     torch.cuda.empty_cache()
 
-    total_loss, evaluated_on_tokens = evaluate_model(
+    total_loss, evaluated_on_tokens, f1, metric_score = evaluate_model(
         model, my_test_dataloader, device,
         target_eval_tokens=100_000_000,
     )
@@ -1040,6 +1060,8 @@ def main(args):
         wandb.log({
             "final_eval_loss": total_loss,
             "final_eval_tokens": evaluated_on_tokens,
+            "f1_score":f1,
+            "metric_score":metric_score
             },
             step=global_step,
         )
@@ -1056,6 +1078,8 @@ def main(args):
             wandb.log({
                 "final_test_loss": total_loss,
                 "final_test_tokens": evaluated_on_tokens,
+                "final_f1_score":f1,
+                "metric_score":metric_score
                 },
                 step=global_step,
             )
