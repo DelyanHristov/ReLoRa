@@ -1,7 +1,7 @@
 import itertools
 import multiprocessing
 from itertools import chain
-
+from torch.nn.utils.rnn import pad_sequence
 import torch
 from torch.utils.data import BatchSampler, DataLoader, IterableDataset, get_worker_info
 from transformers import AutoTokenizer, default_data_collator
