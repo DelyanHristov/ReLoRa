@@ -146,6 +146,7 @@ def parse_args(args=None):
     return args
 
 
+
 @torch.no_grad()
 def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens=10_000_000):
     _time = time.time()
@@ -446,6 +447,8 @@ def main(args):
             train_dataset = train_dataset.shuffle(seed=args.seed)
 
         eval_dataset = dataset_dict["validation"]
+       # print(eval_dataset)
+       # raise
 
         # ##############################
         # Verify dataset
@@ -498,7 +501,7 @@ def main(args):
         model = LlamaForCausalLM(model_config)
     else:
         logger.info(f"Using HuggingFace model {args.model_name_or_path} revision {args.model_revision}")
-        model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, revision=args.model_revision)
+        model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, revision=args.model_revision, num_labels=2)
         model_config = model.config
 
     global_step = 0
@@ -797,6 +800,8 @@ def main(args):
 
     df_eval = eval_dataset.to_pandas()
     list_of_dicts_2 = df_eval.to_dict(orient='records')
+    #print(list_of_dicts_2[0])
+    #raise
 
     
        
@@ -1058,6 +1063,42 @@ def main(args):
 
     if global_rank == 0:
         wandb.finish()
+    model.eval()
+    all_predictions = []
+    all_labels = []
+
+    for i in tqdm(range(len(list_of_dicts_2))):
+   #print(eval_dataset[i])
+        inputs  = list_of_dicts_2[i]
+   #print(input)
+        #print(list_of_dicts_2[i])
+
+        output = list_of_dicts_2[i]["label"]
+
+        model.eval()
+# Forward pass to get logits (predictions)
+        with torch.no_grad():
+
+          outputs = model(input_ids = torch.tensor(inputs["input_ids"]).unsqueeze(0).to("cuda"), attention_mask = torch.tensor(inputs["attention_mask"]).unsqueeze(0).to("cuda"))
+          logits = outputs.logits
+
+# Convert logits to probabilities
+        probabilities = torch.softmax(logits, dim=-1)
+
+# Get predicted class label
+        predicted_class = torch.argmax(logits, dim=-1).item()
+
+
+
+        all_predictions.append(predicted_class)
+        all_labels.append(output)
+    from datasets import load_metric
+    metric = load_metric("glue", "cola")
+    results = metric.compute(predictions=all_predictions, references=all_labels)
+    print(results)  
+    
+
+    
 
     logger.info("Script finished successfully")
     print(f"Rank {global_rank} finished successfully")
