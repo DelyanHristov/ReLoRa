@@ -1,4 +1,4 @@
-Fimport os
+import os
 import math
 import json
 from typing import List
