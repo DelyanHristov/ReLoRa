@@ -552,7 +552,7 @@ def main(args):
             lora_dropout=0.1,
             target_modules=["q","o","k","v"],
             trainable_scaling=args.train_scaling,
-            keep_original_weights=False,
+            keep_original_weights=True,
             lora_only=not need_linear_weight,
             quantize=args.quantize,
             use_double_quant=args.use_double_quant,
