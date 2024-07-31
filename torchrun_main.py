@@ -55,6 +55,10 @@ from peft_pretraining.dataloader import collate_fn
 from peft_pretraining.megatron_dataset.arguments import NeoXArgs
 from peft_pretraining.megatron_dataset import data_utils as megatron_data_utils
 
+torch.cuda.manual_seed(42)
+torch.manual_seed(42)
+random.seed(42)
+np.random.seed(42)
 transformers.logging.set_verbosity_error()
 
 
@@ -430,7 +434,7 @@ def main(args):
         wandb.init(project="peft_pretraining", tags=args.tags, id=wandb_id, resume="allow", notes=args.comment)
         args.run_name = wandb.run.name
         if args.save_dir is None:
-            args.save_dir = f"checkpoints/{wandb.run.name}"
+            args.save_dir = f"checkpoint/{wandb.run.name}"
 
         os.makedirs(args.save_dir, exist_ok=True)
         with open(os.path.join(args.save_dir, "training_config.yaml"), "w") as f:

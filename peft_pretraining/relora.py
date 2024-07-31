@@ -3,14 +3,14 @@ import math
 import json
 from typing import List
 from dataclasses import dataclass
-
+from safetensors import safe_open
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 import bitsandbytes.functional as bnbF
 
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForSequenceClassification
 
 from loguru import logger
 
@@ -158,7 +158,7 @@ class ReLoRaModel(torch.nn.Module):
 
         config = AutoConfig.from_pretrained(path)
 
-        base_model = AutoModelForCausalLM.from_config(config)
+        base_model = AutoModelForSequenceClassification.from_config(config)
         if "keep_original" in relora_config:
             print("WARNING: keep_original is deprecated. Use lora_only instead.")
             print(f"keep_original: {relora_config['keep_original']}")
@@ -170,10 +170,12 @@ class ReLoRaModel(torch.nn.Module):
 
         model = cls(base_model, **relora_config)
 
-        with open(os.path.join(path, "pytorch_model.bin"), "rb") as f:
-            state_dict = torch.load(f, map_location="cpu")
+        state_dict = {}
+        with safe_open(os.path.join(path, "model.safetensors"), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
 
-        model.wrapped_model.load_state_dict(state_dict, strict=True)
+        model.wrapped_model.load_state_dict(state_dict, strict=False)
         return model
 
 
