@@ -575,7 +575,7 @@ def main(args):
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=0.1,
-            target_modules=["q","o","k","v"],
+            target_modules=["EncDecAttention", "DenseReluDense","SelfAttention"],
             trainable_scaling=args.train_scaling,
             keep_original_weights=True,
             lora_only=not need_linear_weight,
