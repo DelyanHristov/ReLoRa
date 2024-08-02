@@ -97,6 +97,9 @@ class ReLoRaModel(torch.nn.Module):
 
             if not any(target_key in module_name for target_key in target_modules_list):
                 continue
+                
+            if "classification_head" in module_name:
+                continue
 
             weight_data = module.weight.data if keep_original_weights else None
             bias_data = None
