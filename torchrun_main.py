@@ -21,6 +21,7 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     StateDictType,
 )
+from transformers import AutoModelForMaskedLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling, BertConfig, BertModel
 from torch.utils.data import DataLoader # dido dataloader
 
 import transformers
@@ -33,6 +34,7 @@ from transformers import (
 DataCollatorWithPadding,
 AutoModelForSequenceClassification,
 DataCollatorForTokenClassification,
+DataCollatorForLanguageModeling
 )
 import pandas as pd
 from tokenizers import Tokenizer
@@ -54,7 +56,7 @@ from peft_pretraining.dataloader import collate_fn
 
 from peft_pretraining.megatron_dataset.arguments import NeoXArgs
 from peft_pretraining.megatron_dataset import data_utils as megatron_data_utils
-
+import math
 torch.cuda.manual_seed(42)
 torch.manual_seed(42)
 random.seed(42)
@@ -150,7 +152,6 @@ def parse_args(args=None):
 
     return args
 
-metric = load_metric("glue", "cola")
 @torch.no_grad()
 def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens=10_000_000):
     _time = time.time()
@@ -177,9 +178,8 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
 
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        outputs = model(input_ids=batch['input_ids'], labels=batch['labels'])
-        loss = outputs.loss
-        logits = outputs.logits
+        loss = model(**batch).loss
+        
         if torch.isnan(ddp_loss_info[0]):
             print(f"Rank {dist.get_rank()} got nan loss. This is probably a bug.")
 
@@ -189,11 +189,6 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
         ddp_loss_info[1] += 1
         ddp_loss_info[2] += tokens_in_batch
 
-        predictions = torch.argmax(logits, dim=-1).cpu().numpy()
-        labels = batch["labels"].cpu().numpy()
-        all_predictions.extend(predictions)
-        all_labels.extend(labels)
-
     # check if loss is nan
     if torch.isnan(ddp_loss_info[0]):
         raise RuntimeError(f"Rank {rank} got nan loss. This is probably a bug.")
@@ -202,20 +197,15 @@ def evaluate_model(model: nn.Module, eval_dataloader, device, target_eval_tokens
     dist.all_reduce(ddp_loss_info, op=dist.ReduceOp.SUM)
     eval_loss = ddp_loss_info[0] / ddp_loss_info[1]
     evaluated_on_tokens = ddp_loss_info[2].item()
+
+    perplexity = math.exp(eval_loss)
+    
     logger.info(f"Evaluated on {evaluated_on_tokens} tokens, eval loss: {eval_loss:.4f}")
-
-    f1 = f1_score(all_labels, all_predictions, average='weighted')
-    logger.info(f"Evaluation F1 Score: {f1:.4f}")
-
-    metric_results = metric.compute(predictions=all_predictions, references=all_labels)
-    metric_results = metric_results["matthews_correlation"]
-
-    logger.info(f"Evaluation metric Score: {metric_results:.4f}")
-
+    logger.info(f"Perplexity: {perplexity:.2f}")
     logger.info(f"Evaluation took {time.time() - _time:.2f} seconds")
 
     if was_training: model.train()
-    return eval_loss, evaluated_on_tokens, f1, metric_results
+    return eval_loss, evaluated_on_tokens, perplexity
 
 
 def save_model_ddp(model, optimizer, scheduler, training_state_checkpoint, run_config, save_dir):
@@ -486,10 +476,7 @@ def main(args):
         assert dataset_preprocessing_args["sequence_length"] == args.max_length
         logger.info("All good! Loading tokenizer now")
         # ##############################
-        tokenizer = AutoTokenizer.from_pretrained(
-            dataset_preprocessing_args["tokenizer"],
-            model_max_length=args.max_length,
-        )
+        tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-medium")
         logger.info("Tokenizer loaded")
 
     elif args.megatron_dataset_config is not None:
@@ -523,7 +510,17 @@ def main(args):
         model = LlamaForCausalLM(model_config)
     else:
         logger.info(f"Using HuggingFace model {args.model_name_or_path} revision {args.model_revision}")
-        model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, revision=args.model_revision, num_labels=2)
+        #load my model
+        config = BertConfig(
+    hidden_size=512,
+    num_hidden_layers=8,
+    num_attention_heads=8,
+    intermediate_size=2048,
+    max_position_embeddings=512,
+    type_vocab_size=1,  # Adjusted from 2 to 1 based on your config
+    vocab_size=30522,
+)
+        model = AutoModelForMaskedLM.from_config(config)
         model_config = model.config
 
     global_step = 0
@@ -575,7 +572,7 @@ def main(args):
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=0.1,
-            target_modules=["EncDecAttention", "DenseReluDense","SelfAttention","classification_head.dense"],
+            target_modules=["query", "key", "value"],
             trainable_scaling=args.train_scaling,
             keep_original_weights=True,
             lora_only=not need_linear_weight,
@@ -769,7 +766,7 @@ def main(args):
         logger.info(f"Train set size after shard: {len(train_dataset)}")
         print(f"dido2 test {train_dataset}")
         
-        data_collator = DataCollatorForTokenClassification(tokenizer)
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
         
         _skip_batches = update_step * args.gradient_accumulation
         logger.info(f"Skipping the first {_skip_batches} batches")
@@ -801,10 +798,73 @@ def main(args):
     loss_info = torch.tensor([0.0, 0.0, 0.0], device=device)  # loss, n_batches, n_NaNs
     n_skipped_batches = 0
 
+
+    """
+    print("=== Embedding Layer ===")
+    for name, param in model.named_parameters():
+        if "embeddings" in name:
+            print(f"Parameter: {name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}, Dtype: {param.dtype}")
+
+# Encoder layer parameters (including bias)
+    print("\n=== Encoder Layers ===")
+    for name, param in model.named_parameters():
+        if "encoder" in name:
+            print(f"Parameter: {name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}, Dtype: {param.dtype}")
+
+# LoRA-specific parameters (including bias)
+    print("\n=== LoRA Layers ===")
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            print(f"Parameter: {name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}, Dtype: {param.dtype}")
+
+# Classifier head (Masked Language Model Head) parameters (including bias)
+    print("\n=== Classifier Head ===")
+    for name, param in model.named_parameters():
+        if "cls" in name or "predictions" in name:
+            print(f"Parameter: {name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}, Dtype: {param.dtype}")
+
+    """
+
+
+
     # ##############################
     # TRAINING LOOP
     # we assert above that the dataset is large enough to train for num_training_steps, so no need for epochs
     # ##############################
+    def check_requires_grad(model):
+        print("Checking which high-level components require gradients:\n")
+
+    # Checking Embeddings
+        print("Embeddings:")
+        for name, param in model.module.wrapped_model.bert.embeddings.named_parameters():
+            grad_status = "requires gradient" if param.requires_grad else "does NOT require gradient"
+            print(f"  {name} - {grad_status}")
+
+    # Checking Encoder
+        print("\nEncoder:")
+        for i, layer in enumerate(model.module.wrapped_model.bert.encoder.layer):
+            print(f"  Layer {i}:")
+            for name, param in layer.named_parameters():
+                grad_status = "requires gradient" if param.requires_grad else "does NOT require gradient"
+                print(f"    {name} - {grad_status}")
+
+    # Checking Attention
+        print("\nAttention:")
+        for i, layer in enumerate(model.module.wrapped_model.bert.encoder.layer):
+            print(f"  Layer {i} Attention:")
+            for name, param in layer.attention.named_parameters():
+                grad_status = "requires gradient" if param.requires_grad else "does NOT require gradient"
+                print(f"    {name} - {grad_status}")
+
+    # Checking MLM Head
+        print("\nMasked LM Head:")
+        for name, param in model.module.wrapped_model.cls.named_parameters():
+            grad_status = "requires gradient" if param.requires_grad else "does NOT require gradient"
+            print(f"  {name} - {grad_status}")
+
+        print("\nCheck complete.")
+    #print(model)
+    #check_requires_grad(model)
 
     prof = maybe_make_profiler(args)
 
@@ -826,10 +886,10 @@ def main(args):
     #raise
 
     
-       
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15)
 
-    my_train_dataloader = DataLoader(list_of_dicts, batch_size=args.batch_size, shuffle=True,collate_fn = collate_fn) #dido data loader
-    my_test_dataloader = DataLoader(list_of_dicts_2, batch_size=args.batch_size, shuffle=True,collate_fn = collate_fn) #dido data loader
+    my_train_dataloader = DataLoader(list_of_dicts, batch_size=args.batch_size, shuffle=True,collate_fn = data_collator) #dido data loader
+    my_test_dataloader = DataLoader(list_of_dicts_2, batch_size=args.batch_size, shuffle=True,collate_fn = data_collator) #dido data loader
         
     for batch in my_train_dataloader:
         
@@ -851,10 +911,11 @@ def main(args):
 
         batch = {k: v.to(device) for k, v in batch.items()}
         tokens_seen += batch["input_ids"].numel() * world_size
+
         
     
 
-        loss =  model(input_ids=batch['input_ids'], labels=batch['labels']).loss
+        loss =  model(**batch).loss
 
         loss_info[0] += loss.detach()
         loss_info[1] += 1
@@ -926,18 +987,17 @@ def main(args):
         # EVALUATION
         if update_step % args.eval_every == 0:
             logger.info(f"Performing evaluation at step {update_step}")
-            total_loss, evaluated_on_tokens, f1_score_val, metric_score = evaluate_model(model, my_test_dataloader, device)
+            total_loss, evaluated_on_tokens, perplexity = evaluate_model(model, my_test_dataloader, device)
 
             if global_rank == 0:
                 wandb.log({
                     "final_eval_loss": total_loss,
                     "final_eval_tokens": evaluated_on_tokens,
-                    "f1_score": f1_score_val,
-                    "metric_score": metric_score
+                    "perplexity": perplexity,
                     },
                     step=global_step,
                 )
-            logger.info(f"Eval loss at step {update_step}: {total_loss}, F1 Score: {f1_score_val}, Metric Score: {metric_score}")
+            logger.info(f"Eval loss at step {update_step}: {total_loss}, Perplexity: {perplexity}")
         # ##############################
 
         # ##############################
@@ -1055,7 +1115,7 @@ def main(args):
     import gc; gc.collect()
     torch.cuda.empty_cache()
 
-    total_loss, evaluated_on_tokens, f1, metric_score = evaluate_model(
+    total_loss, evaluated_on_tokens, perplexity = evaluate_model(
         model, my_test_dataloader, device,
         target_eval_tokens=100_000_000,
     )
@@ -1064,8 +1124,7 @@ def main(args):
         wandb.log({
             "final_eval_loss": total_loss,
             "final_eval_tokens": evaluated_on_tokens,
-            "f1_score":f1,
-            "metric_score":metric_score
+            "perplexity": perplexity,
             },
             step=global_step,
         )
@@ -1080,10 +1139,9 @@ def main(args):
 
         if global_rank == 0:
             wandb.log({
-                "final_test_loss": total_loss,
-                "final_test_tokens": evaluated_on_tokens,
-                "final_f1_score":f1,
-                "metric_score":metric_score
+               "final_eval_loss": total_loss,
+            "final_eval_tokens": evaluated_on_tokens,
+            "perplexity": perplexity,
                 },
                 step=global_step,
             )
@@ -1091,41 +1149,6 @@ def main(args):
 
     if global_rank == 0:
         wandb.finish()
-    model.eval()
-    all_predictions = []
-    all_labels = []
-
-    for i in tqdm(range(len(list_of_dicts_2))):
-   #print(eval_dataset[i])
-        inputs  = list_of_dicts_2[i]
-   #print(input)
-        #print(list_of_dicts_2[i])
-
-        output = list_of_dicts_2[i]["label"]
-
-        model.eval()
-# Forward pass to get logits (predictions)
-        with torch.no_grad():
-
-          outputs = model(input_ids = torch.tensor(inputs["input_ids"]).unsqueeze(0).to("cuda"), attention_mask = torch.tensor(inputs["attention_mask"]).unsqueeze(0).to("cuda"))
-          logits = outputs.logits
-
-# Convert logits to probabilities
-        probabilities = torch.softmax(logits, dim=-1)
-
-# Get predicted class label
-        predicted_class = torch.argmax(logits, dim=-1).item()
-
-
-
-        all_predictions.append(predicted_class)
-        all_labels.append(output)
-    from datasets import load_metric
-    metric = load_metric("glue", "cola")
-    results = metric.compute(predictions=all_predictions, references=all_labels)
-    print(results)  
-    
-
     
 
     logger.info("Script finished successfully")
