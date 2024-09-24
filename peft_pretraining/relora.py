@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import bitsandbytes as bnb
 import bitsandbytes.functional as bnbF
-
+from transformers import AutoModelForMaskedLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
 from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForSequenceClassification
 
 from loguru import logger
@@ -119,9 +119,9 @@ class ReLoRaModel(torch.nn.Module):
             )
             if self.keep_original_weights:
                 # make lora'ed network to be exacty the same as the original network at initialization
-                nn.init.zeros_(new_module.lora_A.weight)
-                assert new_module.lora_A.bias is None
-                assert new_module.lora_B.bias is None
+                nn.init.zeros_(new_module.lora_B)
+               # assert new_module.lora_A.bias is None
+                #assert new_module.lora_B.bias is None
 
             if self.lora_only:
                 assert not self.keep_original_weights
@@ -158,7 +158,7 @@ class ReLoRaModel(torch.nn.Module):
 
         config = AutoConfig.from_pretrained(path)
 
-        base_model = AutoModelForSequenceClassification.from_config(config)
+        base_model = AutoModelForMaskedLM.from_config(config)
         if "keep_original" in relora_config:
             print("WARNING: keep_original is deprecated. Use lora_only instead.")
             print(f"keep_original: {relora_config['keep_original']}")
@@ -176,6 +176,17 @@ class ReLoRaModel(torch.nn.Module):
                 state_dict[key] = f.get_tensor(key)
 
         model.wrapped_model.load_state_dict(state_dict, strict=False)
+        
+        target_modules = ['query', 'key', 'value']
+
+
+        for name, param in model.named_parameters():
+            if (any(target_module in name for target_module in target_modules) and "lora_" not in name) or "bias" in name:
+                param.requires_grad = False
+        #print(f"{name}: gradients disabled (Base layer with LoRA alternative)")
+            else:
+                param.requires_grad = True
+        #print(f"{name}: gradients enabled")
         return model
 
 
@@ -249,10 +260,13 @@ class ReLoRaLinear(nn.Module):
         self.quantize = quantize
 
         if r > 0:
-            self.lora_A = nn.Linear(in_features, r, bias=False)
-            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-            self.lora_B = nn.Linear(r, out_features, bias=False)
-            nn.init.zeros_(self.lora_B.weight)
+            self.lora_A = nn.Parameter(self.weight.new_zeros((r, in_features)))
+            self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))
+            
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+            
             if trainable_scaling:
                 self.scaling = nn.Parameter(torch.tensor([1.]), requires_grad=True)
             else:
@@ -275,7 +289,7 @@ class ReLoRaLinear(nn.Module):
             return
 
         if not self.quantize:
-            self.weight.data += self.lora_B.weight @ self.lora_A.weight * self._post_lora_scale()
+            self.weight.data += self.lora_B @ self.lora_A * self._post_lora_scale()
         elif self.quantize == "4bit":
             self.weight: bnb.nn.Params4bit
             _weight_fp = torch.empty(self.weight.data.shape, dtype=self.lora_B.weight.dtype, device=self.weight.data.device)
@@ -302,9 +316,9 @@ class ReLoRaLinear(nn.Module):
         else:
             raise ValueError(f"Unknown quantize type: {self.quantize}")
 
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
 
-        nn.init.zeros_(self.lora_B.weight)
         if self.trainable_scaling:
             nn.init.zeros_(self.scaling)
 
@@ -321,5 +335,5 @@ class ReLoRaLinear(nn.Module):
             result = F.linear(x, self.weight, bias=self.bias)
 
         if self.r > 0:
-            result += self.lora_B(self.lora_A(self.lora_dropout(x))) * self._post_lora_scale()
+            result += (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self._post_lora_scale()
         return result
